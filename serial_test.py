@@ -1,11 +1,13 @@
 import serial
 import time
+from collections import deque
 from ultralytics import YOLO
 import cv2
+from firebase_helper import publish_room_state, firebase_is_configured
 
 # ── Serial Setup ──────────────────────────────────────────────────────────────
 try:
-    arduino = serial.Serial('COM7', 9600, timeout=1)
+    arduino = serial.Serial("COM7", 9600, timeout=1)
     time.sleep(2)  # Wait for Arduino to initialize
     arduino_connected = True
     print("Arduino connected on COM7")
@@ -13,14 +15,24 @@ except Exception as e:
     arduino_connected = False
     print(f"Arduino not connected: {e} — running in simulation mode")
 
+
+# ── Firebase Setup ────────────────────────────────────────────────────────────
+firebase_enabled = firebase_is_configured()
+if firebase_enabled:
+    print("Firebase is configured — room state will be published")
+else:
+    print("Firebase not configured — running without cloud sync")
+
+
 def send_command(cmd):
     if arduino_connected:
         arduino.write(f"{cmd}\n".encode())
         print(f"  [serial] Sent: {cmd}")
 
+
 # ── Load Model ────────────────────────────────────────────────────────────────
 print("Loading YOLOv8 model...")
-model = YOLO('yolov8n.pt')
+model = YOLO("yolov8n.pt")
 
 cap = cv2.VideoCapture(0)
 if not cap.isOpened():
@@ -30,45 +42,156 @@ if not cap.isOpened():
 print("Camera opened successfully!")
 print("Press 'q' to quit")
 
-# ── Occupancy Validation Settings ────────────────────────────────────────────
-OCCUPANCY_THRESHOLD = 5.0  # seconds before confirming a person
+# ── FSM State Constants ───────────────────────────────────────────────────────
+IDLE = 0
+LIGHTS = 1
+FAN = 2
+AIRCON = 3
 
-person_first_seen: dict[int, float] = {}
-confirmed_persons: set[int] = set()
+STATE_NAMES = {IDLE: "IDLE", LIGHTS: "LIGHTS", FAN: "FAN", AIRCON: "AIRCON"}
 
-# ── Appliance State + Cooldown ────────────────────────────────────────────────
-appliance_state = {
-    "light": False,
-    "fan":   False,
-    "ac":    False,
-}
-COOLDOWN = 3.0  # seconds to wait before switching appliance state again
-last_switch_time = {
-    "light": 0.0,
-    "fan":   0.0,
-    "ac":    0.0,
-}
+# ── FSM State ─────────────────────────────────────────────────────────────────
+current_state = IDLE
 
-def set_appliance(name, turn_on, current_time):
-    """Only switch if state changed and cooldown has passed."""
-    if appliance_state[name] == turn_on:
-        return  # Already in desired state, do nothing
-    if current_time - last_switch_time[name] < COOLDOWN:
-        return  # Cooldown not finished yet
+# ── Occupancy Tracking Settings ──────────────────────────────────────────────
+OCCUPANCY_THRESHOLD = 5.0  # Seconds a person must be continuously detected
+person_first_seen: dict[int, float] = {}  # {track_id: timestamp when first seen}
+confirmed_persons: set[int] = set()  # Track IDs that passed the threshold
+last_published_state: int | None = None  # Track last published FSM state
 
-    appliance_state[name] = turn_on
-    last_switch_time[name] = current_time
+# ── Frame Stability Settings ────────────────────────────────────────────────
+DEBOUNCE_FRAMES = 8
+DEBOUNCE_TOLERANCE = 1
+confirmed_count_history: deque[int] = deque(maxlen=DEBOUNCE_FRAMES)
+stable_confirmed_count = 0
+stable_confirmed_count_valid = False
 
-    if name == "light":
-        send_command("LIGHT_ON" if turn_on else "LIGHT_OFF")
-    elif name == "fan":
-        send_command("FAN_ON" if turn_on else "FAN_OFF")
-    elif name == "ac":
-        # No relay for AC yet — display only
-        print(f"  [AC] {'ON' if turn_on else 'OFF'} (display only)")
+# ── OFF Delay Settings ────────────────────────────────────────────────────────
+OFF_DELAY_SECONDS = 10.0  # How long to wait after desired state drops before acting
+
+# ── FSM Hysteresis Buffers ───────────────────────────────────────────────────
+off_timer_start = None    # When we started waiting to go to a lower/idle state
+
+CONFIDENCE_THRESHOLD = 0.35
+
+
+def count_to_target_state(count):
+    """Map a stable person count to the desired FSM state."""
+    if count >= 3:
+        return AIRCON
+    elif count >= 2:
+        return FAN
+    elif count >= 1:
+        return LIGHTS
+    else:
+        return IDLE
+
+
+def transition_to(new_state):
+    """
+    Transition the FSM from current_state to new_state.
+    Always explicitly turns OFF devices from the old state
+    before turning ON devices for the new state.
+    """
+    global current_state
+
+    if new_state == current_state:
+        return
+
+    print(f"  [FSM] {STATE_NAMES[current_state]} → {STATE_NAMES[new_state]}")
+
+    # ── Teardown: turn off what the OLD state was running ──────────────────
+    if current_state == AIRCON:
+        print("  [AC] OFF (display only)")
+    if current_state >= FAN and new_state < FAN:
+        send_command("FAN_OFF")
+    if current_state >= LIGHTS and new_state < LIGHTS:
+        send_command("LIGHT_OFF")
+
+    # ── Setup: turn on what the NEW state requires ─────────────────────────
+    if new_state >= LIGHTS and current_state < LIGHTS:
+        send_command("LIGHT_ON")
+    if new_state >= FAN and current_state < FAN:
+        send_command("FAN_ON")
+    if new_state == AIRCON:
+        print("  [AC] ON (display only)")
+
+    current_state = new_state
+
+
+def get_debounced_count(raw_count):
+    """
+    Update occupancy tracking with time-based confirmation.
+    Returns the confirmed occupant count.
+    """
+    current_time = time.time()
+    
+    # ── Collect IDs visible in this frame ────────────────────────────────────
+    current_ids: set[int] = set()
+    if len(raw_count) > 0:
+        # raw_count is passed as a list of track_ids from the caller
+        for track_id in raw_count:
+            current_ids.add(track_id)
+            if track_id not in person_first_seen:
+                person_first_seen[track_id] = current_time
+                print(f"  [tracker] Person ID {track_id} appeared – timer started.")
+
+    # ── Reset timers for IDs that disappeared ────────────────────────────────
+    lost_ids = set(person_first_seen.keys()) - current_ids
+    for lost_id in lost_ids:
+        elapsed = current_time - person_first_seen[lost_id]
+        print(f"  [tracker] Person ID {lost_id} lost after {elapsed:.1f}s – timer reset.")
+        del person_first_seen[lost_id]
+        confirmed_persons.discard(lost_id)
+
+    # ── Promote IDs that have been present long enough ───────────────────────
+    for track_id in current_ids:
+        elapsed = current_time - person_first_seen[track_id]
+        if elapsed >= OCCUPANCY_THRESHOLD and track_id not in confirmed_persons:
+            confirmed_persons.add(track_id)
+            print(f"  [tracker] Person ID {track_id} CONFIRMED as occupant ({elapsed:.1f}s).")
+
+    return len(confirmed_persons), len(current_ids)
+
+
+def get_stable_confirmed_count(confirmed_count):
+    """Debounce the confirmed count across frames before the FSM sees it."""
+    global stable_confirmed_count, stable_confirmed_count_valid
+
+    confirmed_count_history.append(confirmed_count)
+
+    if len(confirmed_count_history) < DEBOUNCE_FRAMES:
+        stable_confirmed_count_valid = False
+        return stable_confirmed_count, stable_confirmed_count_valid
+
+    window_min = min(confirmed_count_history)
+    window_max = max(confirmed_count_history)
+    if window_max - window_min <= DEBOUNCE_TOLERANCE:
+        stable_confirmed_count = int(round(sum(confirmed_count_history) / len(confirmed_count_history)))
+        stable_confirmed_count_valid = True
+    else:
+        stable_confirmed_count_valid = False
+
+    return stable_confirmed_count, stable_confirmed_count_valid
+
+
+def state_to_occupancy(state: int) -> int:
+    """Return an occupancy-count equivalent for a given FSM state.
+
+    This lets the Firebase payload continue to use occupancy-derived
+    appliance flags while ensuring the published values reflect the
+    actual FSM/device state (respecting off-delay hysteresis).
+    """
+    if state >= AIRCON:
+        return 3
+    if state >= FAN:
+        return 2
+    if state >= LIGHTS:
+        return 1
+    return 0
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-
 while True:
     ret, frame = cap.read()
     if not ret:
@@ -77,98 +200,117 @@ while True:
 
     current_time = time.time()
 
+    # Use YOLO tracker (ByteTrack) for persistent person IDs
     results = model.track(frame, persist=True, verbose=False, classes=[0])
 
-    # ── Collect visible IDs ───────────────────────────────────────────────────
-    current_ids: set[int] = set()
+    # ── Collect track IDs visible in this frame ───────────────────────────────
+    track_ids = []
     if results[0].boxes.id is not None:
-        for track_id in results[0].boxes.id.int().tolist():
-            current_ids.add(track_id)
-            if track_id not in person_first_seen:
-                person_first_seen[track_id] = current_time
-                print(f"  [tracker] Person ID {track_id} appeared – timer started.")
+        track_ids = results[0].boxes.id.int().tolist()
 
-    # ── Reset timers for lost IDs ─────────────────────────────────────────────
-    lost_ids = set(person_first_seen.keys()) - current_ids
-    for lost_id in lost_ids:
-        elapsed = current_time - person_first_seen[lost_id]
-        print(f"  [tracker] Person ID {lost_id} lost after {elapsed:.1f}s – timer reset.")
-        del person_first_seen[lost_id]
-        confirmed_persons.discard(lost_id)
+    # ── Update occupancy tracking with time-based confirmation ────────────────
+    confirmed_count, total_detected = get_debounced_count(track_ids)
 
-    # ── Promote long-enough IDs to confirmed ──────────────────────────────────
-    for track_id in current_ids:
-        elapsed = current_time - person_first_seen[track_id]
-        if elapsed >= OCCUPANCY_THRESHOLD and track_id not in confirmed_persons:
-            confirmed_persons.add(track_id)
-            print(f"  [tracker] Person ID {track_id} CONFIRMED ({elapsed:.1f}s).")
+    # ── Frame debounce the confirmed count before FSM decisions ─────────────
+    stable_confirmed_count, stable_confirmed_count_valid = get_stable_confirmed_count(confirmed_count)
 
-    confirmed_count = len(confirmed_persons)
-    total_detected  = len(current_ids)
+    target_state = count_to_target_state(stable_confirmed_count)
 
-    # ── Appliance Decision Engine ─────────────────────────────────────────────
-    # Level 1: 1+ confirmed → Light ON
-    set_appliance("light", confirmed_count >= 1, current_time)
+    # ── FSM Transition with OFF-Delay Hysteresis ──────────────────────────────
+    if stable_confirmed_count_valid and target_state > current_state:
+        # Upgrading (more people): act immediately, reset off timer
+        off_timer_start = None
+        transition_to(target_state)
 
-    # Level 2: 2+ confirmed → Fan ON
-    set_appliance("fan", confirmed_count >= 2, current_time)
+    elif stable_confirmed_count_valid and target_state < current_state:
+        # Downgrading (fewer people): start/check the off-delay timer
+        if off_timer_start is None:
+            off_timer_start = current_time
+        elapsed = current_time - off_timer_start
+        if elapsed >= OFF_DELAY_SECONDS:
+            transition_to(target_state)
+            off_timer_start = None
 
-    # Level 3: 3+ confirmed → AC ON (display only for now)
-    set_appliance("ac", confirmed_count >= 3, current_time)
+    else:
+        # Same state: reset off timer (count stabilized back up)
+        off_timer_start = None
 
-    # Turn everything off if room is empty
-    if confirmed_count == 0:
-        set_appliance("light", False, current_time)
-        set_appliance("fan",   False, current_time)
-        set_appliance("ac",    False, current_time)
+    # ── Publish to Firebase (only when FSM/device state changes) ────────────
+    # Publish the effective FSM state (mapped to an occupancy-equivalent)
+    # so the dashboard reflects the device state after off-delay hysteresis.
+    if firebase_enabled and current_state != last_published_state:
+        try:
+            publish_room_state(state_to_occupancy(current_state), threshold=5)
+            last_published_state = current_state
+        except Exception as e:
+            print(f"  [Firebase] Error publishing state: {e}")
 
     # ── Draw Annotated Frame ──────────────────────────────────────────────────
     annotated_frame = results[0].plot()
 
-    # Per-person timer progress bar
+    # ── HUD Overlay ───────────────────────────────────────────────────────────
+    cv2.putText(
+        annotated_frame,
+        f"Detected: {total_detected}   Confirmed: {confirmed_count}   Stable: {stable_confirmed_count}",
+        (10, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.1,
+        (0, 255, 0),
+        3,
+    )
+
+    cv2.putText(
+        annotated_frame,
+        f"State: {STATE_NAMES[current_state]}   Target: {STATE_NAMES[target_state]}",
+        (10, 75),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.85,
+        (255, 255, 0),
+        2,
+    )
+
+    # Draw per-person timer progress bars
     if results[0].boxes.id is not None:
         for box, track_id in zip(results[0].boxes.xyxy, results[0].boxes.id.int().tolist()):
-            elapsed  = current_time - person_first_seen.get(track_id, current_time)
+            elapsed = current_time - person_first_seen.get(track_id, current_time)
             progress = min(elapsed / OCCUPANCY_THRESHOLD, 1.0)
             x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
 
-            bar_total  = x2 - x1
+            bar_total = x2 - x1
             bar_filled = int(bar_total * progress)
-            bar_color  = (0, 255, 0) if track_id in confirmed_persons else (0, 165, 255)
+            # Orange while waiting, green once confirmed
+            bar_color = (0, 255, 0) if track_id in confirmed_persons else (0, 165, 255)
 
-            cv2.rectangle(annotated_frame, (x1, y2 + 2),  (x2, y2 + 14), (50, 50, 50), -1)
-            cv2.rectangle(annotated_frame, (x1, y2 + 2),  (x1 + bar_filled, y2 + 14), bar_color, -1)
+            # Background track
+            cv2.rectangle(annotated_frame, (x1, y2 + 2), (x2, y2 + 14), (50, 50, 50), -1)
+            # Filled portion
+            cv2.rectangle(annotated_frame, (x1, y2 + 2), (x1 + bar_filled, y2 + 14), bar_color, -1)
 
+            # Status label
             status = "CONFIRMED" if track_id in confirmed_persons else f"{elapsed:.1f}s / {OCCUPANCY_THRESHOLD:.0f}s"
             cv2.putText(annotated_frame, status, (x1, y2 + 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, bar_color, 1)
 
-    # ── HUD Overlay ───────────────────────────────────────────────────────────
-    cv2.putText(annotated_frame,
-                f'Detected: {total_detected}   Confirmed: {confirmed_count}',
-                (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 0), 3)
-
-    hud_y = 80
-    if appliance_state["light"]:
-        cv2.putText(annotated_frame, 'Light ON',
-                    (10, hud_y), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3)
+    hud_y = 115
+    if current_state >= LIGHTS:
+        cv2.putText(annotated_frame, "Light ON", (10, hud_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3)
         hud_y += 40
-    if appliance_state["fan"]:
-        cv2.putText(annotated_frame, 'Fan ON',
-                    (10, hud_y), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
+    if current_state >= FAN:
+        cv2.putText(annotated_frame, "Fan ON", (10, hud_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
         hud_y += 40
-    if appliance_state["ac"]:
-        cv2.putText(annotated_frame, 'AC ON (display only)',
-                    (10, hud_y), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+    if current_state == AIRCON:
+        cv2.putText(annotated_frame, "AC ON (display only)", (10, hud_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
 
-    cv2.imshow('Smart Room Control - Press Q to Quit', annotated_frame)
+    cv2.imshow("Smart Room Control - Press Q to Quit", annotated_frame)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
-send_command("LIGHT_OFF")
-send_command("FAN_OFF")
+transition_to(IDLE)   # Explicitly tears down whatever state we were in
 cap.release()
 cv2.destroyAllWindows()
 if arduino_connected:
