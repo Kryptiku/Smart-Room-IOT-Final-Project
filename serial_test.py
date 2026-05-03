@@ -2,6 +2,7 @@ import serial
 import time
 from ultralytics import YOLO
 import cv2
+from firebase_helper import publish_room_state, firebase_is_configured
 
 # ── Serial Setup ──────────────────────────────────────────────────────────────
 try:
@@ -12,6 +13,14 @@ try:
 except Exception as e:
     arduino_connected = False
     print(f"Arduino not connected: {e} — running in simulation mode")
+
+
+# ── Firebase Setup ────────────────────────────────────────────────────────────
+firebase_enabled = firebase_is_configured()
+if firebase_enabled:
+    print("Firebase is configured — room state will be published")
+else:
+    print("Firebase not configured — running without cloud sync")
 
 
 def send_command(cmd):
@@ -43,16 +52,16 @@ STATE_NAMES = {IDLE: "IDLE", LIGHTS: "LIGHTS", FAN: "FAN", AIRCON: "AIRCON"}
 # ── FSM State ─────────────────────────────────────────────────────────────────
 current_state = IDLE
 
-# ── Debounce Settings ─────────────────────────────────────────────────────────
-DEBOUNCE_FRAMES = 8      # Number of consecutive frames the count must be stable
-DEBOUNCE_TOLERANCE = 1   # Max allowed difference between frames to be "stable"
+# ── Occupancy Tracking Settings ──────────────────────────────────────────────
+OCCUPANCY_THRESHOLD = 5.0  # Seconds a person must be continuously detected
+person_first_seen: dict[int, float] = {}  # {track_id: timestamp when first seen}
+confirmed_persons: set[int] = set()  # Track IDs that passed the threshold
+last_published_count: int | None = None  # Track Firebase publish changes
 
 # ── OFF Delay Settings ────────────────────────────────────────────────────────
 OFF_DELAY_SECONDS = 10.0  # How long to wait after desired state drops before acting
 
-# ── Internal Debounce + Hysteresis Buffers ────────────────────────────────────
-count_history = []        # Rolling buffer of raw_count values
-stable_count = 0          # Last debounce-confirmed count
+# ── FSM Hysteresis Buffers ───────────────────────────────────────────────────
 off_timer_start = None    # When we started waiting to go to a lower/idle state
 
 CONFIDENCE_THRESHOLD = 0.35
@@ -104,22 +113,37 @@ def transition_to(new_state):
 
 def get_debounced_count(raw_count):
     """
-    Append raw_count to the rolling history buffer.
-    Return a stable count only when the last DEBOUNCE_FRAMES values
-    are all within DEBOUNCE_TOLERANCE of each other.
-    Returns None if the count is not yet stable.
+    Update occupancy tracking with time-based confirmation.
+    Returns the confirmed occupant count.
     """
-    count_history.append(raw_count)
-    if len(count_history) > DEBOUNCE_FRAMES:
-        count_history.pop(0)
+    current_time = time.time()
+    
+    # ── Collect IDs visible in this frame ────────────────────────────────────
+    current_ids: set[int] = set()
+    if raw_count > 0:
+        # raw_count is passed as a list of track_ids from the caller
+        for track_id in raw_count:
+            current_ids.add(track_id)
+            if track_id not in person_first_seen:
+                person_first_seen[track_id] = current_time
+                print(f"  [tracker] Person ID {track_id} appeared – timer started.")
 
-    if len(count_history) < DEBOUNCE_FRAMES:
-        return None  # Not enough history yet
+    # ── Reset timers for IDs that disappeared ────────────────────────────────
+    lost_ids = set(person_first_seen.keys()) - current_ids
+    for lost_id in lost_ids:
+        elapsed = current_time - person_first_seen[lost_id]
+        print(f"  [tracker] Person ID {lost_id} lost after {elapsed:.1f}s – timer reset.")
+        del person_first_seen[lost_id]
+        confirmed_persons.discard(lost_id)
 
-    if max(count_history) - min(count_history) <= DEBOUNCE_TOLERANCE:
-        return round(sum(count_history) / len(count_history))
+    # ── Promote IDs that have been present long enough ───────────────────────
+    for track_id in current_ids:
+        elapsed = current_time - person_first_seen[track_id]
+        if elapsed >= OCCUPANCY_THRESHOLD and track_id not in confirmed_persons:
+            confirmed_persons.add(track_id)
+            print(f"  [tracker] Person ID {track_id} CONFIRMED as occupant ({elapsed:.1f}s).")
 
-    return None  # Still flickering
+    return len(confirmed_persons), len(current_ids)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -131,20 +155,18 @@ while True:
 
     current_time = time.time()
 
-    results = model(frame, verbose=False, classes=[0], conf=CONFIDENCE_THRESHOLD)
+    # Use YOLO tracker (ByteTrack) for persistent person IDs
+    results = model.track(frame, persist=True, verbose=False, classes=[0])
 
-    # ── Room-Level Occupancy Signal ───────────────────────────────────────────
-    if results[0].boxes is not None:
-        raw_count = len(results[0].boxes)
-    else:
-        raw_count = 0
+    # ── Collect track IDs visible in this frame ───────────────────────────────
+    track_ids = []
+    if results[0].boxes.id is not None:
+        track_ids = results[0].boxes.id.int().tolist()
 
-    # ── Frame-Based Debounce ──────────────────────────────────────────────────
-    new_stable = get_debounced_count(raw_count)
-    if new_stable is not None:
-        stable_count = new_stable
+    # ── Update occupancy tracking with time-based confirmation ────────────────
+    confirmed_count, total_detected = get_debounced_count(track_ids)
 
-    target_state = count_to_target_state(stable_count)
+    target_state = count_to_target_state(confirmed_count)
 
     # ── FSM Transition with OFF-Delay Hysteresis ──────────────────────────────
     if target_state > current_state:
@@ -165,14 +187,21 @@ while True:
         # Same state: reset off timer (count stabilized back up)
         off_timer_start = None
 
+    # ── Publish to Firebase (only when count changes) ─────────────────────────
+    if firebase_enabled and confirmed_count != last_published_count:
+        try:
+            publish_room_state(confirmed_count, threshold=5)
+            last_published_count = confirmed_count
+        except Exception as e:
+            print(f"  [Firebase] Error publishing state: {e}")
+
     # ── Draw Annotated Frame ──────────────────────────────────────────────────
     annotated_frame = results[0].plot()
 
     # ── HUD Overlay ───────────────────────────────────────────────────────────
-    # ── HUD Overlay ───────────────────────────────────────────────────────────
     cv2.putText(
         annotated_frame,
-        f"Detected: {raw_count}   Stable: {stable_count}",
+        f"Detected: {total_detected}   Confirmed: {confirmed_count}",
         (10, 40),
         cv2.FONT_HERSHEY_SIMPLEX,
         1.1,
@@ -182,13 +211,35 @@ while True:
 
     cv2.putText(
         annotated_frame,
-        f"State: {STATE_NAMES[current_state]}   Target: {STATE_NAMES[count_to_target_state(stable_count)]}",
+        f"State: {STATE_NAMES[current_state]}   Target: {STATE_NAMES[count_to_target_state(confirmed_count)]}",
         (10, 75),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.85,
         (255, 255, 0),
         2,
     )
+
+    # Draw per-person timer progress bars
+    if results[0].boxes.id is not None:
+        for box, track_id in zip(results[0].boxes.xyxy, results[0].boxes.id.int().tolist()):
+            elapsed = current_time - person_first_seen.get(track_id, current_time)
+            progress = min(elapsed / OCCUPANCY_THRESHOLD, 1.0)
+            x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+
+            bar_total = x2 - x1
+            bar_filled = int(bar_total * progress)
+            # Orange while waiting, green once confirmed
+            bar_color = (0, 255, 0) if track_id in confirmed_persons else (0, 165, 255)
+
+            # Background track
+            cv2.rectangle(annotated_frame, (x1, y2 + 2), (x2, y2 + 14), (50, 50, 50), -1)
+            # Filled portion
+            cv2.rectangle(annotated_frame, (x1, y2 + 2), (x1 + bar_filled, y2 + 14), bar_color, -1)
+
+            # Status label
+            status = "CONFIRMED" if track_id in confirmed_persons else f"{elapsed:.1f}s / {OCCUPANCY_THRESHOLD:.0f}s"
+            cv2.putText(annotated_frame, status, (x1, y2 + 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, bar_color, 1)
 
     hud_y = 115
     if current_state >= LIGHTS:
