@@ -1,4 +1,4 @@
-'use client';
+  'use client';
 
 import { useEffect, useState } from 'react';
 import { onValue } from 'firebase/database';
@@ -6,6 +6,10 @@ import { roomStateRef } from '../lib/firebase';
 
 const DEFAULT_STATE = {
   occupancy: 0,
+  lightsOn: false,
+  lightsStatus: 'OFF',
+  fansOn: false,
+  fansStatus: 'OFF',
   airconOn: false,
   airconStatus: 'OFF',
   threshold: 5,
@@ -43,21 +47,36 @@ export default function DashboardPage() {
     return () => unsubscribe();
   }, []);
 
+  const lightsOn = Boolean(roomState.lightsOn);
+  const fansOn = Boolean(roomState.fansOn);
   const airconOn = Boolean(roomState.airconOn);
-  const remainingUntilOn = Math.max(roomState.threshold - roomState.occupancy, 0);
 
   return (
     <main className="dashboard-shell">
       <section className="hero-card">
         <div className="hero-copy">
           <p className="eyebrow">Firebase realtime room monitor</p>
-          <h1>Air Condition Simulation Dashboard</h1>
+          <h1>Smart Room Control Dashboard</h1>
         </div>
 
-        <div className={`status-panel ${airconOn ? 'on' : 'off'}`}>
-          <div className="status-label">Current AC state</div>
-          <div className="status-value">{roomState.airconStatus}</div>
-          <div className="status-subcopy">Threshold: {roomState.threshold} people</div>
+        <div className="appliance-status-grid">
+          <div className={`status-panel ${lightsOn ? 'on' : 'off'}`}>
+            <div className="status-label">Lights</div>
+            <div className="status-value">{roomState.lightsStatus}</div>
+            <div className="status-subcopy">Occupancy ≥ 1</div>
+          </div>
+
+          <div className={`status-panel ${fansOn ? 'on' : 'off'}`}>
+            <div className="status-label">Fans</div>
+            <div className="status-value">{roomState.fansStatus}</div>
+            <div className="status-subcopy">Occupancy ≥ 2</div>
+          </div>
+
+          <div className={`status-panel ${airconOn ? 'on' : 'off'}`}>
+            <div className="status-label">Air Conditioner</div>
+            <div className="status-value">{roomState.airconStatus}</div>
+            <div className="status-subcopy">Occupancy ≥ 3</div>
+          </div>
         </div>
       </section>
 
@@ -66,7 +85,13 @@ export default function DashboardPage() {
           <span className="metric-label">Confirmed occupancy</span>
           <strong className="metric-value">{roomState.occupancy}</strong>
           <span className="metric-footnote">
-            {airconOn ? 'Room is over the trigger point.' : `${remainingUntilOn} more to turn on the AC.`}
+            {roomState.occupancy >= 5 
+              ? 'All appliances are active.' 
+              : `${roomState.occupancy >= 3 
+                ? 'Lights and fans are on.' 
+                : roomState.occupancy >= 1 
+                ? 'Lights are on.' 
+                : 'No appliances active.'}`}
           </span>
         </article>
 

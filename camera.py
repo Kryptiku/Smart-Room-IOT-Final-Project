@@ -2,7 +2,7 @@ from ultralytics import YOLO
 import cv2
 import time
 
-from firebase_helper import firebase_is_configured, publish_room_state
+from firebase_helper import firebase_is_configured, publish_room_state, get_appliance_states
 
 # Load pre-trained YOLOv8 model (nano version for speed)
 print("Loading YOLOv8 model...")
@@ -109,13 +109,23 @@ while True:
                 f'Detected: {total_detected}   Confirmed: {confirmed_count}',
                 (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 0), 3)
 
-    # Appliance control driven by *confirmed* occupants only
-    if confirmed_count >= 5:
+    # Get appliance states based on confirmed occupants
+    appliances = get_appliance_states(confirmed_count)
+    y_offset = 80
+    
+    if appliances['lightsOn']:
+        cv2.putText(annotated_frame, 'Lights ON',
+                    (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+        y_offset += 40
+    
+    if appliances['fansOn']:
+        cv2.putText(annotated_frame, 'Fans ON',
+                    (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+        y_offset += 40
+    
+    if appliances['airconOn']:
         cv2.putText(annotated_frame, 'Aircon ON',
-                    (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
-        if confirmed_count > 3:
-            cv2.putText(annotated_frame, 'Light ON',
-                        (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+                    (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
 
     cv2.imshow('People Detection - Press Q to Quit', annotated_frame)
 

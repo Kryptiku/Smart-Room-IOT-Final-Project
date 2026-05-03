@@ -63,11 +63,17 @@ a {
 }
 
 .hero-card {
-  display: grid;
-  grid-template-columns: minmax(0, 1.5fr) minmax(260px, 0.9fr);
+  display: flex;
+  flex-direction: column;
   gap: 24px;
   padding: 28px;
   border-radius: 28px;
+}
+
+.appliance-status-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 18px;
 }
 
 .eyebrow {
@@ -183,6 +189,10 @@ h1 {
     grid-template-columns: 1fr;
   }
 
+  .appliance-status-grid {
+    grid-template-columns: repeat(3, 1fr);
+  }
+
   .metric-card,
   .metric-card--wide {
     grid-column: span 12;
@@ -199,6 +209,10 @@ h1 {
   .metric-card {
     padding: 20px;
     border-radius: 20px;
+  }
+
+  .appliance-status-grid {
+    grid-template-columns: 1fr;
   }
 
   .grid {

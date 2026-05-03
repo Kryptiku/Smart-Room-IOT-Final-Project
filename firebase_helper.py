@@ -67,17 +67,35 @@ def init_firebase() -> Any:
     return _firebase_app
 
 
+def get_appliance_states(occupancy_count: int) -> dict[str, Any]:
+    """Determine which appliances should be on based on occupancy count.
+    
+    - Lights: on when occupancy >= 1
+    - Fans: on when occupancy >= 2
+    - Aircon: on when occupancy >= 3
+    """
+    return {
+        "lightsOn": occupancy_count >= 1,
+        "fansOn": occupancy_count >= 2,
+        "airconOn": occupancy_count >= 3,
+    }
+
+
 def publish_room_state(occupancy_count: int, threshold: int = 5) -> dict[str, Any]:
     # Ensure we at least have a database URL to target
     database_url = _find_database_url()
     if not database_url:
         raise RuntimeError("FIREBASE_DATABASE_URL is required to write to Firebase")
 
-    aircon_on = occupancy_count >= threshold
+    appliance_states = get_appliance_states(occupancy_count)
     payload = {
         "occupancy": occupancy_count,
-        "airconOn": aircon_on,
-        "airconStatus": "ON" if aircon_on else "OFF",
+        "lightsOn": appliance_states["lightsOn"],
+        "lightsStatus": "ON" if appliance_states["lightsOn"] else "OFF",
+        "fansOn": appliance_states["fansOn"],
+        "fansStatus": "ON" if appliance_states["fansOn"] else "OFF",
+        "airconOn": appliance_states["airconOn"],
+        "airconStatus": "ON" if appliance_states["airconOn"] else "OFF",
         "threshold": threshold,
         "updatedAt": int(time.time()),
     }
