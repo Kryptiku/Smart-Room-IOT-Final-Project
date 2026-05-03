@@ -32,67 +32,97 @@ if not cap.isOpened():
 print("Camera opened successfully!")
 print("Press 'q' to quit")
 
-# ── Occupancy Signal Settings ────────────────────────────────────────────────
+# ── FSM State Constants ───────────────────────────────────────────────────────
+IDLE = 0
+LIGHTS = 1
+FAN = 2
+AIRCON = 3
+
+STATE_NAMES = {IDLE: "IDLE", LIGHTS: "LIGHTS", FAN: "FAN", AIRCON: "AIRCON"}
+
+# ── FSM State ─────────────────────────────────────────────────────────────────
+current_state = IDLE
+
+# ── Debounce Settings ─────────────────────────────────────────────────────────
+DEBOUNCE_FRAMES = 8      # Number of consecutive frames the count must be stable
+DEBOUNCE_TOLERANCE = 1   # Max allowed difference between frames to be "stable"
+
+# ── OFF Delay Settings ────────────────────────────────────────────────────────
+OFF_DELAY_SECONDS = 10.0  # How long to wait after desired state drops before acting
+
+# ── Internal Debounce + Hysteresis Buffers ────────────────────────────────────
+count_history = []        # Rolling buffer of raw_count values
+stable_count = 0          # Last debounce-confirmed count
+off_timer_start = None    # When we started waiting to go to a lower/idle state
+
 CONFIDENCE_THRESHOLD = 0.35
-CONFIRM_SECONDS = 5.0  # Count must persist this long before it is confirmed.
-CONFIRM_DECAY_RATE = 0.7  # Progress decay speed when threshold is not met.
-
-# ── Appliance State + Hysteresis ──────────────────────────────────────────────
-appliance_state = {
-    "light": False,
-    "fan": False,
-    "ac": False,
-}
-
-ON_THRESHOLDS = {
-    "light": 1,
-    "fan": 2,
-    "ac": 3,
-}
-OFF_DELAYS = {
-    "light": 10.0,
-    "fan": 10.0,
-    "ac": 10.0,
-}
-
-# Confirmation progress is time-accumulated and decays on brief dropouts.
-confirm_progress = {
-    "light": 0.0,
-    "fan": 0.0,
-    "ac": 0.0,
-}
-confirmed_levels = {
-    "light": False,
-    "fan": False,
-    "ac": False,
-}
-off_started = {
-    "light": None,
-    "fan": None,
-    "ac": None,
-}
 
 
-def set_appliance(name, turn_on):
-    """Switch appliance only when its state changes."""
-    if appliance_state[name] == turn_on:
+def count_to_target_state(count):
+    """Map a stable person count to the desired FSM state."""
+    if count >= 3:
+        return AIRCON
+    elif count >= 2:
+        return FAN
+    elif count >= 1:
+        return LIGHTS
+    else:
+        return IDLE
+
+
+def transition_to(new_state):
+    """
+    Transition the FSM from current_state to new_state.
+    Always explicitly turns OFF devices from the old state
+    before turning ON devices for the new state.
+    """
+    global current_state
+
+    if new_state == current_state:
         return
 
-    appliance_state[name] = turn_on
+    print(f"  [FSM] {STATE_NAMES[current_state]} → {STATE_NAMES[new_state]}")
 
-    if name == "light":
-        send_command("LIGHT_ON" if turn_on else "LIGHT_OFF")
-    elif name == "fan":
-        send_command("FAN_ON" if turn_on else "FAN_OFF")
-    elif name == "ac":
-        # No relay for AC yet — display only
-        print(f"  [AC] {'ON' if turn_on else 'OFF'} (display only)")
+    # ── Teardown: turn off what the OLD state was running ──────────────────
+    if current_state == AIRCON:
+        print("  [AC] OFF (display only)")
+    if current_state >= FAN and new_state < FAN:
+        send_command("FAN_OFF")
+    if current_state >= LIGHTS and new_state < LIGHTS:
+        send_command("LIGHT_OFF")
+
+    # ── Setup: turn on what the NEW state requires ─────────────────────────
+    if new_state >= LIGHTS and current_state < LIGHTS:
+        send_command("LIGHT_ON")
+    if new_state >= FAN and current_state < FAN:
+        send_command("FAN_ON")
+    if new_state == AIRCON:
+        print("  [AC] ON (display only)")
+
+    current_state = new_state
+
+
+def get_debounced_count(raw_count):
+    """
+    Append raw_count to the rolling history buffer.
+    Return a stable count only when the last DEBOUNCE_FRAMES values
+    are all within DEBOUNCE_TOLERANCE of each other.
+    Returns None if the count is not yet stable.
+    """
+    count_history.append(raw_count)
+    if len(count_history) > DEBOUNCE_FRAMES:
+        count_history.pop(0)
+
+    if len(count_history) < DEBOUNCE_FRAMES:
+        return None  # Not enough history yet
+
+    if max(count_history) - min(count_history) <= DEBOUNCE_TOLERANCE:
+        return round(sum(count_history) / len(count_history))
+
+    return None  # Still flickering
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-
-prev_time = time.time()
-
 while True:
     ret, frame = cap.read()
     if not ret:
@@ -100,8 +130,6 @@ while True:
         break
 
     current_time = time.time()
-    dt = max(0.0, current_time - prev_time)
-    prev_time = current_time
 
     results = model(frame, verbose=False, classes=[0], conf=CONFIDENCE_THRESHOLD)
 
@@ -111,58 +139,40 @@ while True:
     else:
         raw_count = 0
 
-    # ── Confirmation Logic Per Threshold ───────────────────────────────────────
-    for appliance_name in ["light", "fan", "ac"]:
-        meets_threshold = raw_count >= ON_THRESHOLDS[appliance_name]
-        if meets_threshold:
-            confirm_progress[appliance_name] = min(
-                CONFIRM_SECONDS,
-                confirm_progress[appliance_name] + dt,
-            )
-        else:
-            confirm_progress[appliance_name] = max(
-                0.0,
-                confirm_progress[appliance_name] - (dt * CONFIRM_DECAY_RATE),
-            )
+    # ── Frame-Based Debounce ──────────────────────────────────────────────────
+    new_stable = get_debounced_count(raw_count)
+    if new_stable is not None:
+        stable_count = new_stable
 
-        confirmed_levels[appliance_name] = (
-            confirm_progress[appliance_name] >= CONFIRM_SECONDS
-        )
+    target_state = count_to_target_state(stable_count)
 
-    confirmed_count = 0
-    if confirmed_levels["light"]:
-        confirmed_count = 1
-    if confirmed_levels["fan"]:
-        confirmed_count = 2
-    if confirmed_levels["ac"]:
-        confirmed_count = 3
+    # ── FSM Transition with OFF-Delay Hysteresis ──────────────────────────────
+    if target_state > current_state:
+        # Upgrading (more people): act immediately, reset off timer
+        off_timer_start = None
+        transition_to(target_state)
 
-    # ── Appliance Decision Engine with OFF Delay Hysteresis ──────────────────
-    for appliance_name in ["light", "fan", "ac"]:
-        desired_on = confirmed_levels[appliance_name]
+    elif target_state < current_state:
+        # Downgrading (fewer people): start/check the off-delay timer
+        if off_timer_start is None:
+            off_timer_start = current_time
+        elapsed = current_time - off_timer_start
+        if elapsed >= OFF_DELAY_SECONDS:
+            transition_to(target_state)
+            off_timer_start = None
 
-        if desired_on:
-            off_started[appliance_name] = None
-            set_appliance(appliance_name, True)
-            continue
-
-        if appliance_state[appliance_name]:
-            if off_started[appliance_name] is None:
-                off_started[appliance_name] = current_time
-            elapsed_off = current_time - off_started[appliance_name]
-            if elapsed_off >= OFF_DELAYS[appliance_name]:
-                set_appliance(appliance_name, False)
-                off_started[appliance_name] = None
-        else:
-            off_started[appliance_name] = None
+    else:
+        # Same state: reset off timer (count stabilized back up)
+        off_timer_start = None
 
     # ── Draw Annotated Frame ──────────────────────────────────────────────────
     annotated_frame = results[0].plot()
 
     # ── HUD Overlay ───────────────────────────────────────────────────────────
+    # ── HUD Overlay ───────────────────────────────────────────────────────────
     cv2.putText(
         annotated_frame,
-        f"Detected: {raw_count}   Confirmed: {confirmed_count}",
+        f"Detected: {raw_count}   Stable: {stable_count}",
         (10, 40),
         cv2.FONT_HERSHEY_SIMPLEX,
         1.1,
@@ -172,47 +182,26 @@ while True:
 
     cv2.putText(
         annotated_frame,
-        f'Progress L/F/A: {confirm_progress["light"]:.1f}/{confirm_progress["fan"]:.1f}/{confirm_progress["ac"]:.1f}s',
-        (10, 70),
+        f"State: {STATE_NAMES[current_state]}   Target: {STATE_NAMES[count_to_target_state(stable_count)]}",
+        (10, 75),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.75,
+        0.85,
         (255, 255, 0),
         2,
     )
 
-    hud_y = 110
-    if appliance_state["light"]:
-        cv2.putText(
-            annotated_frame,
-            "Light ON",
-            (10, hud_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 255, 255),
-            3,
-        )
+    hud_y = 115
+    if current_state >= LIGHTS:
+        cv2.putText(annotated_frame, "Light ON", (10, hud_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3)
         hud_y += 40
-    if appliance_state["fan"]:
-        cv2.putText(
-            annotated_frame,
-            "Fan ON",
-            (10, hud_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 165, 255),
-            3,
-        )
+    if current_state >= FAN:
+        cv2.putText(annotated_frame, "Fan ON", (10, hud_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
         hud_y += 40
-    if appliance_state["ac"]:
-        cv2.putText(
-            annotated_frame,
-            "AC ON (display only)",
-            (10, hud_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 0, 255),
-            3,
-        )
+    if current_state == AIRCON:
+        cv2.putText(annotated_frame, "AC ON (display only)", (10, hud_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
 
     cv2.imshow("Smart Room Control - Press Q to Quit", annotated_frame)
 
@@ -220,8 +209,7 @@ while True:
         break
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
-send_command("LIGHT_OFF")
-send_command("FAN_OFF")
+transition_to(IDLE)   # Explicitly tears down whatever state we were in
 cap.release()
 cv2.destroyAllWindows()
 if arduino_connected:
