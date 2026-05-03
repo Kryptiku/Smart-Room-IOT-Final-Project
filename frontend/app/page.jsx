@@ -51,11 +51,7 @@ export default function DashboardPage() {
       <section className="hero-card">
         <div className="hero-copy">
           <p className="eyebrow">Firebase realtime room monitor</p>
-          <h1>Aircon simulation dashboard</h1>
-          <p className="lead">
-            The live database state turns the virtual AC on once the room reaches the
-            configured occupancy threshold.
-          </p>
+          <h1>Air Condition Simulation Dashboard</h1>
         </div>
 
         <div className={`status-panel ${airconOn ? 'on' : 'off'}`}>
