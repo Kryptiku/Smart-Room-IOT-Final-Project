@@ -1,5 +1,6 @@
 import serial
 import time
+from collections import deque
 from ultralytics import YOLO
 import cv2
 from firebase_helper import publish_room_state, firebase_is_configured
@@ -56,7 +57,14 @@ current_state = IDLE
 OCCUPANCY_THRESHOLD = 5.0  # Seconds a person must be continuously detected
 person_first_seen: dict[int, float] = {}  # {track_id: timestamp when first seen}
 confirmed_persons: set[int] = set()  # Track IDs that passed the threshold
-last_published_count: int | None = None  # Track Firebase publish changes
+last_published_state: int | None = None  # Track last published FSM state
+
+# ── Frame Stability Settings ────────────────────────────────────────────────
+DEBOUNCE_FRAMES = 8
+DEBOUNCE_TOLERANCE = 1
+confirmed_count_history: deque[int] = deque(maxlen=DEBOUNCE_FRAMES)
+stable_confirmed_count = 0
+stable_confirmed_count_valid = False
 
 # ── OFF Delay Settings ────────────────────────────────────────────────────────
 OFF_DELAY_SECONDS = 10.0  # How long to wait after desired state drops before acting
@@ -146,6 +154,43 @@ def get_debounced_count(raw_count):
     return len(confirmed_persons), len(current_ids)
 
 
+def get_stable_confirmed_count(confirmed_count):
+    """Debounce the confirmed count across frames before the FSM sees it."""
+    global stable_confirmed_count, stable_confirmed_count_valid
+
+    confirmed_count_history.append(confirmed_count)
+
+    if len(confirmed_count_history) < DEBOUNCE_FRAMES:
+        stable_confirmed_count_valid = False
+        return stable_confirmed_count, stable_confirmed_count_valid
+
+    window_min = min(confirmed_count_history)
+    window_max = max(confirmed_count_history)
+    if window_max - window_min <= DEBOUNCE_TOLERANCE:
+        stable_confirmed_count = int(round(sum(confirmed_count_history) / len(confirmed_count_history)))
+        stable_confirmed_count_valid = True
+    else:
+        stable_confirmed_count_valid = False
+
+    return stable_confirmed_count, stable_confirmed_count_valid
+
+
+def state_to_occupancy(state: int) -> int:
+    """Return an occupancy-count equivalent for a given FSM state.
+
+    This lets the Firebase payload continue to use occupancy-derived
+    appliance flags while ensuring the published values reflect the
+    actual FSM/device state (respecting off-delay hysteresis).
+    """
+    if state >= AIRCON:
+        return 3
+    if state >= FAN:
+        return 2
+    if state >= LIGHTS:
+        return 1
+    return 0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 while True:
     ret, frame = cap.read()
@@ -166,15 +211,18 @@ while True:
     # ── Update occupancy tracking with time-based confirmation ────────────────
     confirmed_count, total_detected = get_debounced_count(track_ids)
 
-    target_state = count_to_target_state(confirmed_count)
+    # ── Frame debounce the confirmed count before FSM decisions ─────────────
+    stable_confirmed_count, stable_confirmed_count_valid = get_stable_confirmed_count(confirmed_count)
+
+    target_state = count_to_target_state(stable_confirmed_count)
 
     # ── FSM Transition with OFF-Delay Hysteresis ──────────────────────────────
-    if target_state > current_state:
+    if stable_confirmed_count_valid and target_state > current_state:
         # Upgrading (more people): act immediately, reset off timer
         off_timer_start = None
         transition_to(target_state)
 
-    elif target_state < current_state:
+    elif stable_confirmed_count_valid and target_state < current_state:
         # Downgrading (fewer people): start/check the off-delay timer
         if off_timer_start is None:
             off_timer_start = current_time
@@ -187,11 +235,13 @@ while True:
         # Same state: reset off timer (count stabilized back up)
         off_timer_start = None
 
-    # ── Publish to Firebase (only when count changes) ─────────────────────────
-    if firebase_enabled and confirmed_count != last_published_count:
+    # ── Publish to Firebase (only when FSM/device state changes) ────────────
+    # Publish the effective FSM state (mapped to an occupancy-equivalent)
+    # so the dashboard reflects the device state after off-delay hysteresis.
+    if firebase_enabled and current_state != last_published_state:
         try:
-            publish_room_state(confirmed_count, threshold=5)
-            last_published_count = confirmed_count
+            publish_room_state(state_to_occupancy(current_state), threshold=5)
+            last_published_state = current_state
         except Exception as e:
             print(f"  [Firebase] Error publishing state: {e}")
 
@@ -201,7 +251,7 @@ while True:
     # ── HUD Overlay ───────────────────────────────────────────────────────────
     cv2.putText(
         annotated_frame,
-        f"Detected: {total_detected}   Confirmed: {confirmed_count}",
+        f"Detected: {total_detected}   Confirmed: {confirmed_count}   Stable: {stable_confirmed_count}",
         (10, 40),
         cv2.FONT_HERSHEY_SIMPLEX,
         1.1,
@@ -211,7 +261,7 @@ while True:
 
     cv2.putText(
         annotated_frame,
-        f"State: {STATE_NAMES[current_state]}   Target: {STATE_NAMES[count_to_target_state(confirmed_count)]}",
+        f"State: {STATE_NAMES[current_state]}   Target: {STATE_NAMES[target_state]}",
         (10, 75),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.85,
