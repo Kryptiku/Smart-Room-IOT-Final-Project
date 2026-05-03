@@ -2,6 +2,8 @@ from ultralytics import YOLO
 import cv2
 import time
 
+from firebase_helper import firebase_is_configured, publish_room_state
+
 # Load pre-trained YOLOv8 model (nano version for speed)
 print("Loading YOLOv8 model...")
 model = YOLO('yolov8n.pt')  # Will auto-download if not present
@@ -25,6 +27,8 @@ person_first_seen: dict[int, float] = {}
 
 # Track IDs that have passed the threshold and are confirmed occupants
 confirmed_persons: set[int] = set()
+last_published_count: int | None = None
+firebase_warning_shown = False
 # ─────────────────────────────────────────────────────────────────────────────
 
 while True:
@@ -65,6 +69,16 @@ while True:
     confirmed_count = len(confirmed_persons)
     total_detected  = len(current_ids)
 
+    if firebase_is_configured() and confirmed_count != last_published_count:
+        try:
+            publish_room_state(confirmed_count, threshold=5)
+            last_published_count = confirmed_count
+        except Exception as exc:
+            print(f"Firebase publish failed: {exc}")
+    elif not firebase_is_configured() and not firebase_warning_shown:
+        print("Firebase publish skipped: set FIREBASE_CREDENTIALS_PATH and FIREBASE_DATABASE_URL")
+        firebase_warning_shown = True
+
     # ── Draw annotated frame with bounding boxes ─────────────────────────────
     annotated_frame = results[0].plot()
 
@@ -96,7 +110,7 @@ while True:
                 (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 0), 3)
 
     # Appliance control driven by *confirmed* occupants only
-    if confirmed_count > 1:
+    if confirmed_count >= 5:
         cv2.putText(annotated_frame, 'Aircon ON',
                     (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
         if confirmed_count > 3:
