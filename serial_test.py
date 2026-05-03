@@ -120,7 +120,7 @@ def get_debounced_count(raw_count):
     
     # ── Collect IDs visible in this frame ────────────────────────────────────
     current_ids: set[int] = set()
-    if raw_count > 0:
+    if len(raw_count) > 0:
         # raw_count is passed as a list of track_ids from the caller
         for track_id in raw_count:
             current_ids.add(track_id)
